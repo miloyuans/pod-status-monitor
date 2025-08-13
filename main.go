@@ -1,17 +1,21 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
@@ -23,6 +27,20 @@ import (
 var (
 	telegramToken  string
 	telegramChatID int64
+	clusterName    string
+)
+
+// EventCacheEntry stores events for a pod and the last alert time
+type EventCacheEntry struct {
+	Events        []corev1.Event
+	LastAlertTime time.Time
+}
+
+// eventCache maps pod key (namespace/name) to its events
+var (
+	eventCache     = make(map[string]*EventCacheEntry)
+	cacheMutex     = sync.Mutex{}
+	alertThreshold = time.Minute * 5 // Time window for merging events and rate-limiting alerts
 )
 
 func main() {
@@ -42,6 +60,19 @@ func main() {
 		fmt.Sscanf(chatIDStr, "%d", &telegramChatID)
 	}
 
+	// 获取 Kubernetes Clientset（支持 EKS 外部访问）
+	clientset, err := getKubeClient()
+	if err != nil {
+		log.Fatalf("Failed to create Kubernetes client: %v", err)
+	}
+
+	// 从 ConfigMap 读取 cluster_name
+	clusterName, err = loadClusterNameFromConfigMap(clientset, "default", "pod-monitor-config")
+	if err != nil {
+		log.Fatalf("Failed to load cluster name from ConfigMap: %v", err)
+	}
+	log.Printf("Loaded cluster name: %s", clusterName)
+
 	// 初始化 Telegram Bot
 	bot, err := tgbotapi.NewBotAPI(telegramToken)
 	if err != nil {
@@ -49,12 +80,6 @@ func main() {
 	}
 	bot.Debug = true // 可选：启用调试日志
 	log.Printf("Authorized on Telegram account %s", bot.Self.UserName)
-
-	// 获取 Kubernetes Clientset（支持 EKS 外部访问）
-	clientset, err := getKubeClient()
-	if err != nil {
-		log.Fatalf("Failed to create Kubernetes client: %v", err)
-	}
 
 	// 创建 Shared Informer Factory（监控所有命名空间，resync 周期 30 分钟）
 	factory := informers.NewSharedInformerFactory(clientset, 30*time.Minute)
@@ -64,37 +89,27 @@ func main() {
 	eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			event := obj.(*corev1.Event)
-			log.Printf("Event Added: Namespace=%s, InvolvedObject=%s, Reason=%s, Message=%s", event.Namespace, event.InvolvedObject.Name, event.Reason, event.Message)
-			// 可扩展：存储到数据库或进一步分析
+			if event.InvolvedObject.Kind == "Pod" {
+				log.Printf("Event Added: Namespace=%s, Pod=%s, Type=%s, Reason=%s, Message=%s", event.Namespace, event.InvolvedObject.Name, event.Type, event.Reason, event.Message)
+				checkAndAlertPodStatus(bot, clientset, event)
+			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldEvent := oldObj.(*corev1.Event)
 			newEvent := newObj.(*corev1.Event)
-			log.Printf("Event Updated: Namespace=%s, InvolvedObject=%s, Reason=%s -> %s, Message=%s", newEvent.Namespace, newEvent.InvolvedObject.Name, oldEvent.Reason, newEvent.Reason, newEvent.Message)
+			if newEvent.InvolvedObject.Kind == "Pod" {
+				log.Printf("Event Updated: Namespace=%s, Pod=%s, Type=%s, Reason=%s, Message=%s", newEvent.Namespace, newEvent.InvolvedObject.Name, newEvent.Type, newEvent.Reason, newEvent.Message)
+				checkAndAlertPodStatus(bot, clientset, newEvent)
+			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			event := obj.(*corev1.Event)
-			log.Printf("Event Deleted: Namespace=%s, InvolvedObject=%s, Reason=%s", event.Namespace, event.InvolvedObject.Name, event.Reason)
-		},
-	})
-
-	// 设置 Pods Informer 用于监控 Pod 状态并报警
-	podInformer := factory.Core().V1().Pods().Informer()
-	podInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			pod := obj.(*corev1.Pod)
-			log.Printf("Pod Added: %s/%s", pod.Namespace, pod.Name)
-			checkAndAlertPodStatus(bot, pod)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldPod := oldObj.(*corev1.Pod)
-			newPod := newObj.(*corev1.Pod)
-			log.Printf("Pod Updated: %s/%s, Phase: %s -> %s", newPod.Namespace, newPod.Name, oldPod.Status.Phase, newPod.Status.Phase)
-			checkAndAlertPodStatus(bot, newPod)
-		},
-		DeleteFunc: func(obj interface{}) {
-			pod := obj.(*corev1.Pod)
-			log.Printf("Pod Deleted: %s/%s", pod.Namespace, pod.Name)
+			if event.InvolvedObject.Kind == "Pod" {
+				log.Printf("Event Deleted: Namespace=%s, Pod=%s, Type=%s, Reason=%s", event.Namespace, event.InvolvedObject.Name, event.Type, event.Reason)
+				// Clean up cache on event deletion
+				cacheMutex.Lock()
+				delete(eventCache, fmt.Sprintf("%s/%s", event.Namespace, event.InvolvedObject.Name))
+				cacheMutex.Unlock()
+			}
 		},
 	})
 
@@ -103,6 +118,9 @@ func main() {
 	defer close(stopCh)
 	factory.Start(stopCh)
 	factory.WaitForCacheSync(stopCh)
+
+	// 定期清理旧事件
+	go cleanupEventCache()
 
 	// 监听信号以优雅退出
 	sigCh := make(chan os.Signal, 1)
@@ -133,29 +151,98 @@ func getKubeClient() (*kubernetes.Clientset, error) {
 	return kubernetes.NewForConfig(config)
 }
 
-// 检查 Pod 状态并发送 Telegram 报警
-func checkAndAlertPodStatus(bot *tgbotapi.BotAPI, pod *corev1.Pod) {
-	alertMsg := ""
-	switch pod.Status.Phase {
-	case corev1.PodFailed, corev1.PodUnknown:
-		alertMsg = fmt.Sprintf("Pod Alert: %s/%s is in %s phase! Reason: %s", pod.Namespace, pod.Name, pod.Status.Phase, pod.Status.Reason)
-	default:
-		// 检查 Pod 条件中的错误
-		for _, cond := range pod.Status.Conditions {
-			if cond.Status == corev1.ConditionFalse && cond.Type == corev1.PodReady {
-				alertMsg = fmt.Sprintf("Pod Alert: %s/%s is not ready! Reason: %s, Message: %s", pod.Namespace, pod.Name, cond.Reason, cond.Message)
-				break
+// 从 ConfigMap 读取 cluster_name
+func loadClusterNameFromConfigMap(clientset *kubernetes.Clientset, namespace, name string) (string, error) {
+	cm, err := clientset.CoreV1().ConfigMaps(namespace).Get(context.Background(), name, metav1.GetOptions{})
+	if err != nil {
+		return "", fmt.Errorf("failed to get ConfigMap %s/%s: %w", namespace, name, err)
+	}
+	clusterName, ok := cm.Data["cluster_name"]
+	if !ok || clusterName == "" {
+		return "", fmt.Errorf("cluster_name not found in ConfigMap %s/%s", namespace, name)
+	}
+	return clusterName, nil
+}
+
+// 清理过时的事件缓存
+func cleanupEventCache() {
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		cacheMutex.Lock()
+		for podKey, entry := range eventCache {
+			if time.Since(entry.LastAlertTime) > alertThreshold {
+				delete(eventCache, podKey)
 			}
 		}
+		cacheMutex.Unlock()
+	}
+}
+
+// 检查 Pod 状态并发送 Telegram 报警
+func checkAndAlertPodStatus(bot *tgbotapi.BotAPI, clientset *kubernetes.Clientset, event *corev1.Event) {
+	if event.InvolvedObject.Kind != "Pod" || event.Type != corev1.EventTypeWarning {
+		return // 只处理 Pod 相关的 Warning 事件
 	}
 
-	if alertMsg != "" {
-		msg := tgbotapi.NewMessage(telegramChatID, alertMsg)
-		_, err := bot.Send(msg)
-		if err != nil {
-			log.Printf("Failed to send Telegram alert: %v", err)
-		} else {
-			log.Printf("Telegram alert sent: %s", alertMsg)
-		}
+	podKey := fmt.Sprintf("%s/%s", event.Namespace, event.InvolvedObject.Name)
+
+	// 获取 Pod 信息以提取标签
+	pod, err := clientset.CoreV1().Pods(event.Namespace).Get(context.Background(), event.InvolvedObject.Name, metav1.GetOptions{})
+	if err != nil {
+		log.Printf("Failed to get pod %s: %v", podKey, err)
+		return
+	}
+
+	// 更新事件缓存
+	cacheMutex.Lock()
+	entry, exists := eventCache[podKey]
+	if !exists {
+		entry = &EventCacheEntry{Events: []corev1.Event{}}
+		eventCache[podKey] = entry
+	}
+	entry.Events = append(entry.Events, *event)
+	cacheMutex.Unlock()
+
+	// 检查是否需要发送报警（基于时间窗口）
+	if time.Since(entry.LastAlertTime) < alertThreshold {
+		return // 避免重复报警
+	}
+
+	// 构建 Markdown 格式的报警消息
+	serviceName := pod.Labels["app"]
+	if serviceName == "" {
+		serviceName = pod.Labels["k8s-app"]
+	}
+	if serviceName == "" {
+		serviceName = "Unknown"
+	}
+	currentTime := time.Now().Format("2006-01-02 15:04:05 MST")
+
+	// 合并事件信息
+	var reasons []string
+	var messages []string
+	for _, e := range entry.Events {
+		reasons = append(reasons, e.Reason)
+		messages = append(messages, e.Message)
+	}
+	reasonSummary := strings.Join(reasons, ", ")
+	messageSummary := strings.Join(messages, "; ")
+
+	alertMsg := fmt.Sprintf(
+		"**Pod Alert**:\n- **Cluster**: %s\n- **Pod Name**: %s\n- **Namespace**: %s\n- **Service**: %s\n- **Time**: %s\n- **Status**: Warning\n- **Reasons**: %s\n- **Messages**: %s",
+		clusterName, event.InvolvedObject.Name, event.Namespace, serviceName, currentTime, reasonSummary, messageSummary)
+
+	// 发送 Telegram 报警
+	msg := tgbotapi.NewMessage(telegramChatID, alertMsg)
+	msg.ParseMode = "Markdown"
+	_, err = bot.Send(msg)
+	if err != nil {
+		log.Printf("Failed to send Telegram alert: %v", err)
+	} else {
+		log.Printf("Telegram alert sent: %s", alertMsg)
+		cacheMutex.Lock()
+		entry.LastAlertTime = time.Now()
+		cacheMutex.Unlock()
 	}
 }
