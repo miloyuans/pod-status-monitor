@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -30,9 +32,9 @@ var (
 	clusterName    string
 )
 
-// EventCacheEntry stores events for a pod and the last alert time
+// EventCacheEntry stores events for a pod, grouped by reason, and the last alert time
 type EventCacheEntry struct {
-	Events        []corev1.Event
+	Events        map[string][]corev1.Event // Map of reason to events
 	LastAlertTime time.Time
 }
 
@@ -89,21 +91,21 @@ func main() {
 	eventInformer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(obj interface{}) {
 			event := obj.(*corev1.Event)
-			if event.InvolvedObject.Kind == "Pod" {
+			if event.InvolvedObject.Kind == "Pod" && event.Type == corev1.EventTypeWarning {
 				log.Printf("Event Added: Namespace=%s, Pod=%s, Type=%s, Reason=%s, Message=%s", event.Namespace, event.InvolvedObject.Name, event.Type, event.Reason, event.Message)
 				checkAndAlertPodStatus(bot, clientset, event)
 			}
 		},
 		UpdateFunc: func(oldObj, newObj interface{}) {
 			newEvent := newObj.(*corev1.Event)
-			if newEvent.InvolvedObject.Kind == "Pod" {
+			if newEvent.InvolvedObject.Kind == "Pod" && newEvent.Type == corev1.EventTypeWarning {
 				log.Printf("Event Updated: Namespace=%s, Pod=%s, Type=%s, Reason=%s, Message=%s", newEvent.Namespace, newEvent.InvolvedObject.Name, newEvent.Type, newEvent.Reason, newEvent.Message)
 				checkAndAlertPodStatus(bot, clientset, newEvent)
 			}
 		},
 		DeleteFunc: func(obj interface{}) {
 			event := obj.(*corev1.Event)
-			if event.InvolvedObject.Kind == "Pod" {
+			if event.InvolvedObject.Kind == "Pod" && event.Type == corev1.EventTypeWarning {
 				log.Printf("Event Deleted: Namespace=%s, Pod=%s, Type=%s, Reason=%s", event.Namespace, event.InvolvedObject.Name, event.Type, event.Reason)
 				// Clean up cache on event deletion
 				cacheMutex.Lock()
@@ -179,6 +181,77 @@ func cleanupEventCache() {
 	}
 }
 
+// 转义 MarkdownV2 特殊字符
+func escapeMarkdownV2(text string) string {
+	specialChars := []string{"_", "*", "[", "]", "(", ")", "~", "`", ">", "#", "+", "-", "=", "|", "{", "}", ".", "!"}
+	for _, char := range specialChars {
+		text = strings.ReplaceAll(text, char, "\\"+char)
+	}
+	return text
+}
+
+// 检查 Pod 是否未就绪
+func isPodNotReady(pod *corev1.Pod) bool {
+	for _, cond := range pod.Status.Conditions {
+		if cond.Type == corev1.PodReady && cond.Status == corev1.ConditionFalse {
+			return true
+		}
+	}
+	return false
+}
+
+// 获取 Pod 日志（最后 5 行，最大 1000 字符）
+func getPodLogs(clientset *kubernetes.Clientset, namespace, podName string) (string, error) {
+	req := clientset.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+		TailLines: int64Ptr(5), // 获取最后 5 行
+	})
+	logs, err := req.Stream(context.Background())
+	if err != nil {
+		return "", fmt.Errorf("failed to get logs for pod %s/%s: %w", namespace, podName, err)
+	}
+	defer logs.Close()
+
+	var buf bytes.Buffer
+	_, err = io.Copy(&buf, logs)
+	if err != nil {
+		return "", fmt.Errorf("failed to read logs for pod %s/%s: %w", namespace, podName, err)
+	}
+
+	logContent := buf.String()
+	if logContent == "" {
+		return "No logs available", nil
+	}
+
+	// 截断日志以避免超过 Telegram 消息限制（4096 字符）
+	if len(logContent) > 1000 {
+		logContent = logContent[:1000] + "... [truncated]"
+	}
+
+	// 按行分割并取最后 5 行
+	lines := strings.Split(strings.TrimSpace(logContent), "\n")
+	if len(lines) > 5 {
+		lines = lines[len(lines)-5:]
+	}
+	logContent = strings.Join(lines, "\n")
+
+	return logContent, nil
+}
+
+// 辅助函数：将 int64 转换为指针
+func int64Ptr(i int64) *int64 {
+	return &i
+}
+
+// 辅助函数：检查切片中是否包含指定字符串
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
+}
+
 // 检查 Pod 状态并发送 Telegram 报警
 func checkAndAlertPodStatus(bot *tgbotapi.BotAPI, clientset *kubernetes.Clientset, event *corev1.Event) {
 	if event.InvolvedObject.Kind != "Pod" || event.Type != corev1.EventTypeWarning {
@@ -187,26 +260,38 @@ func checkAndAlertPodStatus(bot *tgbotapi.BotAPI, clientset *kubernetes.Clientse
 
 	podKey := fmt.Sprintf("%s/%s", event.Namespace, event.InvolvedObject.Name)
 
-	// 获取 Pod 信息以提取标签
+	// 获取 Pod 信息以检查状态和提取标签
 	pod, err := clientset.CoreV1().Pods(event.Namespace).Get(context.Background(), event.InvolvedObject.Name, metav1.GetOptions{})
 	if err != nil {
 		log.Printf("Failed to get pod %s: %v", podKey, err)
 		return
 	}
 
-	// 更新事件缓存
+	// 只处理未就绪的 Pod
+	if !isPodNotReady(pod) {
+		return
+	}
+
+	// 更新事件缓存，按 Reason 分组
 	cacheMutex.Lock()
 	entry, exists := eventCache[podKey]
 	if !exists {
-		entry = &EventCacheEntry{Events: []corev1.Event{}}
+		entry = &EventCacheEntry{Events: make(map[string][]corev1.Event)}
 		eventCache[podKey] = entry
 	}
-	entry.Events = append(entry.Events, *event)
+	entry.Events[event.Reason] = append(entry.Events[event.Reason], *event)
 	cacheMutex.Unlock()
 
 	// 检查是否需要发送报警（基于时间窗口）
 	if time.Since(entry.LastAlertTime) < alertThreshold {
 		return // 避免重复报警
+	}
+
+	// 获取 Pod 日志
+	logContent, err := getPodLogs(clientset, event.Namespace, event.InvolvedObject.Name)
+	if err != nil {
+		log.Printf("Failed to fetch logs for %s: %v", podKey, err)
+		logContent = "Failed to fetch logs"
 	}
 
 	// 构建 Markdown 格式的报警消息
@@ -219,23 +304,68 @@ func checkAndAlertPodStatus(bot *tgbotapi.BotAPI, clientset *kubernetes.Clientse
 	}
 	currentTime := time.Now().Format("2006-01-02 15:04:05 MST")
 
-	// 合并事件信息
-	var reasons []string
-	var messages []string
-	for _, e := range entry.Events {
-		reasons = append(reasons, e.Reason)
-		messages = append(messages, e.Message)
+	// 合并事件信息，包含事件计数
+	var reasonSummaries []string
+	var messageSummaries []string
+	for reason, events := range entry.Events {
+		count := len(events)
+		var messages []string
+		for _, e := range events {
+			if !contains(messages, e.Message) {
+				messages = append(messages, e.Message)
+			}
+		}
+		reasonSummaries = append(reasonSummaries, fmt.Sprintf("%s (%d times)", reason, count))
+		messageSummaries = append(messageSummaries, strings.Join(messages, "; "))
 	}
-	reasonSummary := strings.Join(reasons, ", ")
-	messageSummary := strings.Join(messages, "; ")
+	reasonSummary := strings.Join(reasonSummaries, ", ")
+	messageSummary := strings.Join(messageSummaries, "; ")
 
+	// 转义 MarkdownV2 特殊字符
+	escapedClusterName := escapeMarkdownV2(clusterName)
+	escapedPodName := escapeMarkdownV2(event.InvolvedObject.Name)
+	escapedNamespace := escapeMarkdownV2(event.Namespace)
+	escapedServiceName := escapeMarkdownV2(serviceName)
+	escapedCurrentTime := escapeMarkdownV2(currentTime)
+	escapedReasonSummary := escapeMarkdownV2(reasonSummary)
+	escapedMessageSummary := escapeMarkdownV2(messageSummary)
+	escapedLogContent := escapeMarkdownV2(logContent)
+
+	// 优化 MarkdownV2 格式，使用 emoji 和加粗，添加日志
 	alertMsg := fmt.Sprintf(
-		"**Pod Alert**:\n- **Cluster**: %s\n- **Pod Name**: %s\n- **Namespace**: %s\n- **Service**: %s\n- **Time**: %s\n- **Status**: Warning\n- **Reasons**: %s\n- **Messages**: %s",
-		clusterName, event.InvolvedObject.Name, event.Namespace, serviceName, currentTime, reasonSummary, messageSummary)
+		"⚠️ *Pod Alert*\n"+
+			"**🖥️ Cluster**: %s\n"+
+			"**📛 Pod Name**: %s\n"+
+			"**🌐 Namespace**: %s\n"+
+			"**🔧 Service**: %s\n"+
+			"**⏰ Time**: %s\n"+
+			"**⚠️ Status**: Not Ready\n"+
+			"**❗ Reasons**: %s\n"+
+			"**💬 Messages**: %s\n"+
+			"**📜 Logs**:\n```%s```",
+		escapedClusterName, escapedPodName, escapedNamespace, escapedServiceName, escapedCurrentTime, escapedReasonSummary, escapedMessageSummary, escapedLogContent)
+
+	// 检查消息长度（Telegram 限制 4096 字符）
+	if len(alertMsg) > 4096 {
+		log.Printf("Alert message too long (%d characters), truncating logs", len(alertMsg))
+		escapedLogContent = escapeMarkdownV2(logContent[:500] + "... [truncated]")
+		alertMsg = fmt.Sprintf(
+			"⚠️ *Pod Alert*\n"+
+				"**🖥️ Cluster**: %s\n"+
+				"**📛 Pod Name**: %s\n"+
+				"**🌐 Namespace**: %s\n"+
+				"**🔧 Service**: %s\n"+
+				"**⏰ Time**: %s\n"+
+				"**⚠️ Status**: Not Ready\n"+
+				"**❗ Reasons**: %s\n"+
+				"**💬 Messages**: %s\n"+
+				"**📜 Logs**:\n```%s```",
+			escapedClusterName, escapedPodName, escapedNamespace, escapedServiceName, escapedCurrentTime, escapedReasonSummary, escapedMessageSummary, escapedLogContent)
+	}
 
 	// 发送 Telegram 报警
 	msg := tgbotapi.NewMessage(telegramChatID, alertMsg)
-	msg.ParseMode = "Markdown"
+	msg.ParseMode = "MarkdownV2"
 	_, err = bot.Send(msg)
 	if err != nil {
 		log.Printf("Failed to send Telegram alert: %v", err)
